@@ -131,84 +131,89 @@ export default class PgIpc<T = any> extends (EventEmitter as {
   }
 
   reconnect: () => Promise<void> = (): Promise<void> => {
-    return (
-      this.reconnectPromise ||
-      (this.reconnectPromise = (async () => {
-        this.options.log?.debug('.reconnect')
-        this.checkEnded()
-        if (this.client) {
-          this.client.removeListener('notification', this.handleNotification)
-          this.client.removeListener('error', this.handleError)
-          this.client.end().catch((error) => {
-            this.options.log?.error('failed to end previous client:', error)
-          })
-        }
-        this.client = undefined
+    const doReconnect = async () => {
+      this.options.log?.debug('.reconnect')
+      this.checkEnded()
+      if (this.client) {
+        this.client.removeListener('notification', this.handleNotification)
+        this.client.removeListener('error', this.handleError)
+        this.client.end().catch((error) => {
+          this.options.log?.error('failed to end previous client:', error)
+        })
+      }
+      this.client = undefined
+      const { initialDelay, maxDelay, maxRetries, factor } =
+        this.options.reconnect
+      let delay = initialDelay
+      let retry = 0
+      while (++retry <= maxRetries) {
         try {
-          const { initialDelay, maxDelay, maxRetries, factor } =
-            this.options.reconnect
-          let delay = initialDelay
-          let retry = 0
-          while (++retry <= maxRetries) {
-            try {
-              this.checkEnded()
-              this.options.log?.debug('connecting...')
-              const client = this.options.newClient()
-              client.on('notification', this.handleNotification)
-              client.on('error', this.handleError)
-              await client.connect()
-              this.options.log?.debug('connected')
-              this.checkEnded()
-              this.emit('connect', client)
-              const promises = []
-              for (const channel of this.subs.keys()) {
-                promises.push(
-                  client.query(`LISTEN ${quoteIdentifier(channel)};`)
-                )
-                if (promises.length >= 1000) {
-                  await Promise.all(promises)
-                  promises.length = 0
-                  this.checkEnded()
-                }
-              }
-              for (let i = 0; i < this.notifyQueue.length; i++) {
-                const notification = this.notifyQueue[i]
-                if (!notification) continue
-                if (notification.length === 2) {
-                  const [channel, payload] = notification
-                  await client.query(`SELECT pg_notify($1, $2)`, [
-                    channel,
-                    payload,
-                  ])
-                } else {
-                  const [channel] = notification
-                  await client.query(`NOTIFY ${quoteIdentifier(channel)}`)
-                }
-                this.notifyQueue[i] = null
-                this.checkEnded()
-              }
-              this.notifyQueue.length = 0
-              this.client = client
-              this.emit('ready')
-              break
-            } catch (error) {
-              this.options.log?.error('failed to connect:', error)
-              this.emit('error', error)
-              if (retry >= maxRetries) throw error
-            }
-            this.options.log?.debug('retrying in', delay, 'ms')
-            await new Promise((resolve) => setTimeout(resolve, delay))
-            this.checkEnded()
-            delay = Math.max(
-              initialDelay,
-              Math.min(maxDelay, Math.round(delay * factor))
-            )
-          }
-        } finally {
-          this.reconnectPromise = undefined
+          this.checkEnded()
+          this.options.log?.debug('connecting...')
+          const client = this.options.newClient()
+          client.on('notification', this.handleNotification)
+          client.on('error', this.handleError)
+          await client.connect()
+          this.options.log?.debug('connected')
+          this.checkEnded()
+          this.emit('connect', client)
+          await this.replayListens(client)
+          await this.replayNotifies(client)
+          this.client = client
+          this.emit('ready')
+          break
+        } catch (error) {
+          this.options.log?.error('failed to connect:', error)
+          this.emit('error', error)
+          if (retry >= maxRetries) throw error
         }
-      })())
-    )
+        this.options.log?.debug('retrying in', delay, 'ms')
+        await new Promise((resolve) => setTimeout(resolve, delay))
+        this.checkEnded()
+        delay = Math.max(
+          initialDelay,
+          Math.min(maxDelay, Math.round(delay * factor))
+        )
+      }
+    }
+    if (!this.reconnectPromise) {
+      this.reconnectPromise = doReconnect().finally(
+        () => (this.reconnectPromise = undefined)
+      )
+      this.reconnectPromise.catch(() => {
+        // ignore
+      })
+    }
+    return this.reconnectPromise
+  }
+
+  private async replayListens(client: Client): Promise<void> {
+    const promises = []
+    for (const channel of this.subs.keys()) {
+      promises.push(client.query(`LISTEN ${quoteIdentifier(channel)};`))
+      if (promises.length >= 1000) {
+        await Promise.all(promises)
+        promises.length = 0
+        this.checkEnded()
+      }
+    }
+  }
+
+  private async replayNotifies(client: Client): Promise<void> {
+    for (let i = 0; i < this.notifyQueue.length; i++) {
+      const notification = this.notifyQueue[i]
+      if (!notification) continue
+      if (notification.length === 2) {
+        const [channel, payload] = notification
+        await client.query(`SELECT pg_notify($1, $2)`, [channel, payload])
+      } else {
+        const [channel] = notification
+        await client.query(`NOTIFY ${quoteIdentifier(channel)}`)
+      }
+      this.notifyQueue[i] = null
+      this.checkEnded()
+    }
+    this.notifyQueue.length = 0
   }
 
   private handleNotification: (msg: Notification) => void = ({
