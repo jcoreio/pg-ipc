@@ -1,0 +1,80 @@
+// @flow
+
+import EventEmitter from '@jcoreio/typed-event-emitter'
+import type { Client, Notification } from 'pg'
+import VError from 'verror'
+
+export type PgIpcEvents = {
+  error: [any],
+  warning: [any],
+  connecting: [Client],
+  connected: [Client],
+  disconnected: [],
+  ready: [],
+  end: [],
+  ...
+}
+
+export type PgIpcOptions<
+  /**
+   * Payload type
+   */
+  T = any
+> = {|
+  /**
+   * Creates a new pg Client.  This will be called on every connection attempt
+   */
+  newClient: () => Client,
+  /**
+   * Pass an object with some or all console methods to enable logging
+   */
+  log?: $Shape<typeof console>,
+  /**
+   * Only use this if you compiled postgres with a custom NAMEDATALEN to allow longer channel names.
+   * Default: 63
+   */
+  maxChannelLength?: number,
+  /**
+   * Converts payloads to strings.  Default: JSON.stringify
+   */
+  stringify?: (payload: T) => string,
+  /**
+   * Parses raw payloads from Postgres notifications.  Default: JSON.parse
+   */
+  parse?: (rawPayload: string) => T,
+  /**
+   * Reconnect exponential backoff options
+   */
+  reconnect?: {|
+    /**
+     * The delay before the first reconnect attempt, in milliseconds
+     * Default: maxDelay / 10 or 1000.
+     */
+    initialDelay?: number,
+    /**
+     * The maximum delay between reconnect attempts, in milliseconds
+     * Default: initialDelay * 10 or 10000.
+     */
+    maxDelay?: number,
+    /**
+     * The maximum number of times to try to reconnect before giving up and emitting an error.
+     * Default: Infinity (never stop retrying)
+     */
+    maxRetries?: number,
+    /**
+     * The factor to multiply the reconnect delay by after each failure.  Default: 2
+     */
+    factor?: number,
+  |},
+|}
+
+export type Listener<T = any> = (channel: string, payload?: T) => any
+
+declare export default class PgIpc<T = any> extends EventEmitter<PgIpcEvents> {
+  constructor(options: PgIpcOptions<T>): void;
+  end(): Promise<void>;
+  connect: () => Promise<void>;
+  notify(channel: string, payload?: T): Promise<void>;
+  listen(channel: string, listener: Listener<T>): Promise<void>;
+  unlisten(channel: string, listener: Listener<T>): Promise<void>;
+}

@@ -14,9 +14,7 @@ export interface PgIpcEvents {
   end: () => void
 }
 
-type PgIpcEmitter = StrictEventEmitter<EventEmitter, PgIpcEvents>
-
-type PgIpcOptions<
+export type PgIpcOptions<
   /**
    * Payload type
    */
@@ -82,11 +80,13 @@ type ResolvedPgIpcOptions<T = any> = {
   }
 }
 
-type Listener<T = any> = (channel: string, payload?: T) => any
+export type Listener<T = any> = (channel: string, payload?: T) => any
 
 function quoteIdentifier(id: string): string {
   return /^[_a-z][_a-z0-9$]*$/i.test(id) ? id : `"${id.replace(/"/g, '""')}"`
 }
+
+type PgIpcEmitter = StrictEventEmitter<EventEmitter, PgIpcEvents>
 
 export default class PgIpc<T = any> extends (EventEmitter as {
   new (): PgIpcEmitter
@@ -104,7 +104,7 @@ export default class PgIpc<T = any> extends (EventEmitter as {
     stringify,
     parse,
     reconnect,
-  }: PgIpcOptions) {
+  }: PgIpcOptions<T>) {
     super()
     if (
       maxChannelLength != null &&

@@ -132,6 +132,7 @@
   },
   "dependencies": {
     "@babel/runtime": "^7.15.4",
+    "@jcoreio/typed-event-emitter": "^1.1.0",
     "strict-event-emitter-types": "^2.0.0",
     "verror": "^1.10.1"
   }

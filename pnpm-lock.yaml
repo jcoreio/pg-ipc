@@ -12,6 +12,7 @@ specifiers:
   '@babel/runtime': ^7.15.4
   '@commitlint/cli': ^13.2.0
   '@commitlint/config-conventional': ^13.2.0
+  '@jcoreio/typed-event-emitter': ^1.1.0
   '@jedwards1211/commitlint-config': ^1.0.2
   '@jedwards1211/eslint-config': ^2.0.2
   '@jedwards1211/eslint-config-typescript': ^2.0.2
@@ -53,6 +54,7 @@ specifiers:
 
 dependencies:
   '@babel/runtime': 7.16.3
+  '@jcoreio/typed-event-emitter': 1.1.0
   strict-event-emitter-types: 2.0.0
   verror: 1.10.1
 
@@ -1547,6 +1549,12 @@ packages:
       node-addon-api: 2.0.2
     dev: true
     optional: true
+
+  /@jcoreio/typed-event-emitter/1.1.0:
+    resolution: {integrity: sha512-/jipgciwKe/MpQ1CB1Sx2tuEPDfWH5cJksNrC0XM6cZuVD9b4DgvkCExPD71+R7jAd8I1dK3xoHoGdcJfFscOQ==}
+    dependencies:
+      p-timeout: 3.2.0
+    dev: false
 
   /@jedwards1211/commitlint-config/1.0.2_db33d810306ae408ecef6d6d3186638e:
     resolution: {integrity: sha512-uxU9AP8eqIcjLilNpe5h3fO0AQWG+Ds/z0xJTl0gBgWtA1CNR5td8lEbJm7VLmjQD5O+V8gylzJM3zB0wi6aew==}
@@ -4885,7 +4893,6 @@ packages:
   /p-finally/1.0.0:
     resolution: {integrity: sha1-P7z7FbiZpEEjs0ttzBi3JDNqLK4=}
     engines: {node: '>=4'}
-    dev: true
 
   /p-is-promise/3.0.0:
     resolution: {integrity: sha512-Wo8VsW4IRQSKVXsJCn7TomUaVtyfjVDn3nUP7kE967BQk0CwFpdbZs0X0uk5sW9mkBa9eNM7hCMaG93WUAwxYQ==}
@@ -4978,7 +4985,6 @@ packages:
     engines: {node: '>=8'}
     dependencies:
       p-finally: 1.0.0
-    dev: true
 
   /p-try/1.0.0:
     resolution: {integrity: sha1-y8ec26+P1CKOE/Yh8rGiN8GyB7M=}
