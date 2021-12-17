@@ -14,3 +14,4 @@ node_modules
 !/test/**/*.js
 !/test/**/*.js.flow
 !/.babelrc.js
+!/env/*.js
