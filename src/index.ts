@@ -6,7 +6,7 @@ import { VError } from 'verror'
 
 export interface PgIpcEvents {
   error: (error: any) => void
-  clientError: (error: any) => void
+  warning: (error: any) => void
   connecting: (client: Client) => void
   connected: (client: Client) => void
   disconnected: () => void
@@ -16,27 +16,61 @@ export interface PgIpcEvents {
 
 type PgIpcEmitter = StrictEventEmitter<EventEmitter, PgIpcEvents>
 
-type PgIpcOptions<T = any> = {
-  log?: typeof console
+type PgIpcOptions<
   /**
-   * Creates a new pg Client.  This will be called on start and
+   * Payload type
+   */
+  T = any
+> = {
+  /**
+   * Creates a new pg Client.  This will be called on every connection attempt
    */
   newClient: () => Client
+  /**
+   * Pass an object with some or all console methods to enable logging
+   */
+  log?: Partial<typeof console>
+  /**
+   * Only use this if you compiled postgres with a custom NAMEDATALEN to allow longer channel names.
+   * Default: 63
+   */
+  maxChannelLength?: number
+  /**
+   * Converts payloads to strings.  Default: JSON.stringify
+   */
   stringify?: (payload: T) => string
+  /**
+   * Parses raw payloads from Postgres notifications.  Default: JSON.parse
+   */
   parse?: (rawPayload: string) => T
+  /**
+   * Reconnect exponential backoff options
+   */
   reconnect?: {
+    /**
+     * The delay before the first reconnect attempt, in milliseconds
+     * Default: maxDelay / 10 or 1000.
+     */
     initialDelay?: number
+    /**
+     * The maximum delay between reconnect attempts, in milliseconds
+     * Default: initialDelay * 10 or 10000.
+     */
     maxDelay?: number
+    /**
+     * The maximum number of times to try to reconnect before giving up and emitting an error.
+     * Default: Infinity (never stop retrying)
+     */
     maxRetries?: number
+    /**
+     * The factor to multiply the reconnect delay by after each failure.  Default: 2
+     */
     factor?: number
   }
 }
 
 type ResolvedPgIpcOptions<T = any> = {
-  log?: typeof console
-  /**
-   * Creates a new pg Client.  This will be called on start and
-   */
+  maxChannelLength: number
   newClient: () => Client
   stringify: (payload: T) => string
   parse: (rawPayload: string) => T
@@ -48,7 +82,7 @@ type ResolvedPgIpcOptions<T = any> = {
   }
 }
 
-type Listener<T = any> = (payload?: T) => any
+type Listener<T = any> = (channel: string, payload?: T) => any
 
 function quoteIdentifier(id: string): string {
   return /^[_a-z][_a-z0-9$]*$/i.test(id) ? id : `"${id.replace(/"/g, '""')}"`
@@ -58,12 +92,28 @@ export default class PgIpc<T = any> extends (EventEmitter as {
   new (): PgIpcEmitter
 }) {
   private client: Client | undefined
+  private log: Partial<typeof console> | undefined
   private options: ResolvedPgIpcOptions<T>
   private subs: Map<string, Set<Listener<T>>> = new Map()
   private notifyQueue: ([string] | [string, string] | null)[] = []
 
-  constructor({ log, newClient, stringify, parse, reconnect }: PgIpcOptions) {
+  constructor({
+    log,
+    newClient,
+    maxChannelLength,
+    stringify,
+    parse,
+    reconnect,
+  }: PgIpcOptions) {
     super()
+    if (
+      maxChannelLength != null &&
+      (!Number.isInteger(maxChannelLength) || maxChannelLength <= 0)
+    ) {
+      throw new Error(
+        `options.maxChannelLength must be an integer > 0 if given`
+      )
+    }
     if (
       reconnect?.initialDelay != null &&
       (!Number.isFinite(reconnect.initialDelay) || reconnect.initialDelay <= 0)
@@ -96,32 +146,40 @@ export default class PgIpc<T = any> extends (EventEmitter as {
         `options.reconnect.factor must be a finite number > 1 if given`
       )
     }
+    this.log = log
     this.options = {
-      log,
       newClient,
       stringify: stringify || ((payload) => JSON.stringify(payload)),
       parse: parse || ((raw) => JSON.parse(raw)),
+      maxChannelLength: maxChannelLength ?? 63,
       reconnect: {
-        initialDelay: reconnect?.initialDelay ?? 10,
-        maxDelay: reconnect?.maxDelay ?? 10000,
+        initialDelay:
+          reconnect?.initialDelay ??
+          (reconnect?.maxDelay && Math.round(reconnect.maxDelay / 10)) ??
+          1000,
+        maxDelay:
+          reconnect?.maxDelay ??
+          (reconnect?.initialDelay && reconnect.initialDelay * 10) ??
+          10000,
         maxRetries: reconnect?.maxRetries ?? Infinity,
         factor: reconnect?.factor ?? 2,
       },
     }
-    this.reconnect()
+    this.connect()
   }
 
   private checkLength(channel: string): void {
-    if (channel.length > 63) {
+    const { maxChannelLength } = this.options
+    if (channel.length > maxChannelLength) {
       throw new Error(
-        `Channel is longer than 63 characters: ${JSON.stringify(
+        `Channel is longer than ${maxChannelLength} characters: ${JSON.stringify(
           channel
-        )}.  @jcoreio/pg-ipc couldn't reliably call the correct listeners in this case because Postgres truncates channels longer than 63 characters.  Please truncate the channels you pass to @jcoreio/pg-ipc.`
+        )}.  @jcoreio/pg-ipc couldn't reliably call the correct listeners in this case because Postgres truncates channels longer than ${maxChannelLength} characters.  Please truncate the channels you pass to @jcoreio/pg-ipc.`
       )
     }
   }
 
-  private reconnectPromise: Promise<void> | undefined
+  private connectPromise: Promise<void> | undefined
   private ended = false
 
   private checkEnded(): void {
@@ -130,7 +188,7 @@ export default class PgIpc<T = any> extends (EventEmitter as {
 
   async end(): Promise<void> {
     try {
-      this.options.log?.debug('.end')
+      this.log?.debug?.('.end')
       this.checkEnded()
       this.ended = true
       await this.client?.end()
@@ -139,40 +197,46 @@ export default class PgIpc<T = any> extends (EventEmitter as {
     }
   }
 
-  reconnect: () => Promise<void> = (): Promise<void> => {
+  private warning(error: Error) {
+    this.log?.warn?.(error)
+    this.emit('warning', error)
+  }
+
+  connect: () => Promise<void> = (): Promise<void> => {
+    this.log?.debug?.('.connect')
     const removeListeners = (client: Client) => {
       client.removeListener('notification', this.handleNotification)
       client.removeListener('error', this.handleError)
     }
-    const doReconnect = async () => {
-      this.options.log?.debug('.reconnect')
+    const doConnect = async () => {
       this.checkEnded()
       const prevClient = this.client
       this.client = undefined
       if (prevClient) {
         removeListeners(prevClient)
         prevClient.end().catch((error) => {
-          this.options.log?.error('failed to end previous client:', error)
+          this.log?.error?.('failed to end previous client:', error)
         })
       }
       const { initialDelay, maxDelay, maxRetries, factor } =
         this.options.reconnect
-      let delay = initialDelay
-      let retry = 0
-      while (++retry <= maxRetries) {
+      let connectRetry = 0
+      let connectDelay = initialDelay
+      while (++connectRetry <= maxRetries) {
         this.checkEnded()
         try {
-          this.options.log?.debug('connecting...')
+          this.log?.debug?.('connecting...')
           const client = this.options.newClient()
           client.on('notification', this.handleNotification)
           client.on('error', this.handleError)
           let connected = false
           client.once('end', () => {
+            this.log?.debug?.('client ended')
             if (this.client === client) this.client = undefined
             removeListeners(client)
             if (connected && !this.ended) {
               this.emit('disconnected')
-              this.reconnect().catch(() => {
+              this.connect().catch(() => {
                 /**/
               })
             }
@@ -180,7 +244,7 @@ export default class PgIpc<T = any> extends (EventEmitter as {
           this.emit('connecting', client)
           await client.connect()
           connected = true
-          this.options.log?.debug('connected')
+          this.log?.debug?.('connected')
           this.checkEnded()
           this.emit('connected', client)
           await this.replayListens(client)
@@ -188,47 +252,58 @@ export default class PgIpc<T = any> extends (EventEmitter as {
           this.client = client
           this.emit('ready')
           break
-        } catch (error) {
-          this.options.log?.error('failed to connect:', error)
-          if (retry >= maxRetries) {
+        } catch (error: any) {
+          if (connectRetry >= maxRetries) {
             const verror = new VError(
-              `all ${maxRetries} connect attempts failed`,
-              error
+              error,
+              `all ${maxRetries} connect attempts failed`
             )
             this.emit('error', verror)
+            this.end().catch(() => {
+              /**/
+            })
             throw verror
           }
-          this.emit('clientError', error)
+          this.warning(
+            new VError(error, `connect attempt ${connectRetry} failed`)
+          )
         }
-        this.options.log?.debug('retrying in', delay, 'ms')
-        await new Promise((resolve) => setTimeout(resolve, delay))
+        this.log?.debug?.('retrying in', connectDelay, 'ms')
+        await new Promise((resolve) => setTimeout(resolve, connectDelay))
         this.checkEnded()
-        delay = Math.max(
+        connectDelay = Math.max(
           initialDelay,
-          Math.min(maxDelay, Math.round(delay * factor))
+          Math.min(maxDelay, Math.round(connectDelay * factor))
         )
       }
     }
-    if (!this.reconnectPromise) {
-      this.reconnectPromise = doReconnect().finally(
-        () => (this.reconnectPromise = undefined)
+    if (!this.connectPromise) {
+      this.connectPromise = doConnect().finally(
+        () => (this.connectPromise = undefined)
       )
-      this.reconnectPromise.catch(() => {
+      this.connectPromise.catch(() => {
         // ignore
       })
     }
-    return this.reconnectPromise
+    return this.connectPromise
   }
 
   private async replayListens(client: Client): Promise<void> {
     const promises = []
     for (const channel of this.subs.keys()) {
+      this.log?.debug?.('replaying listen', {
+        channel,
+      })
       promises.push(client.query(`LISTEN ${quoteIdentifier(channel)};`))
       if (promises.length >= 1000) {
         await Promise.all(promises)
         promises.length = 0
         this.checkEnded()
       }
+    }
+    if (promises.length) {
+      await Promise.all(promises)
+      this.checkEnded()
     }
   }
 
@@ -238,9 +313,16 @@ export default class PgIpc<T = any> extends (EventEmitter as {
       if (!notification) continue
       if (notification.length === 2) {
         const [channel, payload] = notification
+        this.log?.debug?.('replaying notify', {
+          channel,
+          payload,
+        })
         await client.query(`SELECT pg_notify($1, $2)`, [channel, payload])
       } else {
         const [channel] = notification
+        this.log?.debug?.('replaying notify', {
+          channel,
+        })
         await client.query(`NOTIFY ${quoteIdentifier(channel)}`)
       }
       this.notifyQueue[i] = null
@@ -254,15 +336,18 @@ export default class PgIpc<T = any> extends (EventEmitter as {
     payload: rawPayload,
   }: Notification) => {
     if (this.ended) return
-    this.options.log?.debug('.handleNotification', { channel, rawPayload })
+    this.log?.debug?.('.handleNotification', {
+      channel,
+      rawPayload,
+    })
     const listeners = this.subs.get(channel)
     try {
       if (listeners) {
         if (rawPayload) {
           const payload = this.options.parse(rawPayload)
-          for (const listener of listeners) listener(payload)
+          for (const listener of listeners) listener(channel, payload)
         } else {
-          for (const listener of listeners) listener()
+          for (const listener of listeners) listener(channel)
         }
       }
     } catch (error) {
@@ -271,19 +356,24 @@ export default class PgIpc<T = any> extends (EventEmitter as {
   }
 
   private handleError: (error: Error) => void = (error: Error) => {
-    this.options.log?.error('client error:', error)
-    this.emit('clientError', error)
+    this.warning(new VError(error, 'client error'))
   }
 
   async notify(channel: string, payload?: T): Promise<void> {
-    this.options.log?.debug('.notify', { channel, payload })
+    this.log?.debug?.('.notify', {
+      channel,
+      payload,
+    })
     this.checkEnded()
     this.checkLength(channel)
     const { client } = this
     if (payload) {
       const stringified = this.options.stringify(payload)
       const enqueue = () => {
-        this.options.log?.debug('enqueuing', channel, stringified)
+        this.log?.debug?.('enqueuing', {
+          channel,
+          stringified,
+        })
         this.notifyQueue.push([channel, stringified])
       }
       if (!client) enqueue()
@@ -291,12 +381,16 @@ export default class PgIpc<T = any> extends (EventEmitter as {
         await client
           .query(`SELECT pg_notify($1, $2)`, [channel, stringified])
           .catch((error) => {
-            this.options.log?.error('NOTIFY failed:', error.stack)
+            this.warning(
+              new VError(error, 'NOTIFY failed, will retry upon reconnection')
+            )
             enqueue()
           })
     } else {
       const enqueue = () => {
-        this.options.log?.debug('enqueuing', channel)
+        this.log?.debug?.('enqueuing', {
+          channel,
+        })
         this.notifyQueue.push([channel])
       }
       if (!client) enqueue()
@@ -304,14 +398,19 @@ export default class PgIpc<T = any> extends (EventEmitter as {
         await client
           .query(`NOTIFY ${quoteIdentifier(channel)}`)
           .catch((error) => {
-            this.options.log?.error('NOTIFY failed:', error.stack)
+            this.warning(
+              new VError(error, 'NOTIFY failed, will retry upon reconnection')
+            )
             enqueue()
           })
     }
   }
 
   async listen(channel: string, listener: Listener<T>): Promise<void> {
-    this.options.log?.debug('.listen', { channel, listener })
+    this.log?.debug?.('.listen', {
+      channel,
+      listener,
+    })
     this.checkEnded()
     this.checkLength(channel)
     let listeners = this.subs.get(channel)
@@ -327,7 +426,10 @@ export default class PgIpc<T = any> extends (EventEmitter as {
   }
 
   async unlisten(channel: string, listener: Listener<T>): Promise<void> {
-    this.options.log?.debug('.unlisten', { channel, listener })
+    this.log?.debug?.('.unlisten', {
+      channel,
+      listener,
+    })
     this.checkEnded()
     const listeners = this.subs.get(channel)
     if (!listeners?.has(listener)) return

@@ -12,11 +12,31 @@ const DEBUG = /(^|\b)pg-ipc(\b|$)/.test(process.env.DEBUG || '')
 
 class MockClient extends EventEmitter {
   ended = false
+  deferConnect: boolean
+  rejectConnect: boolean
+  rejectQuery: boolean
   queries = []
 
-  constructor({ rejectConnect = false }: { rejectConnect?: boolean } = {}) {
+  connectPromise:
+    | undefined
+    | {
+        resolve: () => void
+        reject: (error: Error) => void
+      }
+
+  constructor({
+    deferConnect = false,
+    rejectConnect = false,
+    rejectQuery = false,
+  }: {
+    deferConnect?: boolean
+    rejectConnect?: boolean
+    rejectQuery?: boolean
+  } = {}) {
     super()
+    this.deferConnect = deferConnect
     this.rejectConnect = rejectConnect
+    this.rejectQuery = rejectQuery
   }
 
   checkEnded() {
@@ -26,6 +46,11 @@ class MockClient extends EventEmitter {
   async connect() {
     this.checkEnded()
     this.emit('connecting', this)
+    if (this.deferConnect) {
+      await new Promise(
+        (resolve, reject) => (this.connectPromise = { resolve, reject })
+      )
+    }
     if (this.rejectConnect) {
       const error = new Error('connection failed')
       this.emit('error', error)
@@ -44,6 +69,14 @@ class MockClient extends EventEmitter {
     this.emit('end')
   }
   async query(...args) {
+    if (this.rejectQuery) {
+      const error = new Error('connection failed')
+      this.emit('error', error)
+      this.end().catch(() => {
+        /**/
+      })
+      throw error
+    }
     this.queries.push(args)
     this.emit('query', ...args)
   }
@@ -138,6 +171,11 @@ describe('PgIpc', function () {
   it(`options validation`, async function () {
     const newClient = () => new MockClient()
 
+    for (const maxChannelLength of [NaN, -Infinity, Infinity, -1, 0]) {
+      expect(() => newIpc({ newClient, maxChannelLength })).to.throw(
+        'options.maxChannelLength must be an integer > 0 if given'
+      )
+    }
     for (const initialDelay of [NaN, -Infinity, Infinity, -1, 0]) {
       expect(() => newIpc({ newClient, reconnect: { initialDelay } })).to.throw(
         'options.reconnect.initialDelay must be a finite number > 0 if given'
@@ -160,6 +198,7 @@ describe('PgIpc', function () {
     }
     await newIpc({
       newClient,
+      maxChannelLength: 127,
       reconnect: {
         initialDelay: 1,
         maxDelay: 1,
@@ -176,12 +215,16 @@ describe('PgIpc', function () {
       })
     ).to.be.rejected
     await expect(ipc.notify('a'.repeat(64), 'a')).to.be.rejected
+
+    const ipc2 = newIpc({ newClient, maxChannelLength: 127 })
+    await ipc2.notify('a'.repeat(127), 'a')
+    await expect(ipc2.notify('a'.repeat(128), 'a')).to.be.rejected
   })
   it(`doesn't allow any actions after .end`, async function () {
     const ipc = newIpc({ newClient: new MockClient() })
     await ipc.end()
     await expect(ipc.end()).to.be.rejected
-    await expect(ipc.reconnect()).to.be.rejected
+    await expect(ipc.connect()).to.be.rejected
     await expect(
       ipc.listen('a', () => {
         /* no-op */
@@ -197,46 +240,44 @@ describe('PgIpc', function () {
   it('basic test', async function () {
     const emitter = new EventEmitter()
     const ipc = newIpc({ newClient })
-    ipc.listen('foo', (payload) => emitter.emit('foo', payload))
-    ipc.listen('bar', (payload) => emitter.emit('bar', payload))
+    ipc.listen('foo', (...args) => emitter.emit('foo', ...args))
+    ipc.listen('bar', (...args) => emitter.emit('bar', ...args))
 
     const payload = { a: 1 }
     const [actual] = await Promise.all([
-      emitted(emitter, 'foo'),
+      emitted(emitter, 'foo', { multiArgs: true }),
       ipc.notify('foo', payload),
     ])
-    expect(actual).to.deep.equal(payload)
+    expect(actual).to.deep.equal(['foo', payload])
 
     const payload2 = { a: 2 }
-    const [actual2] = await Promise.all([
-      Promise.race([
-        emitted(emitter, 'bar'),
-        emitted(emitter, 'foo').then(() =>
-          Promise.reject('expected foo listener not to be called')
-        ),
+    const [actual2] = await during(
+      Promise.all([
+        emitted(emitter, 'bar', { multiArgs: true }),
+        ipc.notify('bar', payload2),
       ]),
-      ipc.notify('bar', payload2),
-    ])
-    expect(actual2).to.deep.equal(payload2)
+      forbidEvent(emitter, 'foo')
+    )
+    expect(actual2).to.deep.equal(['bar', payload2])
   })
   it(`payloadless notifications`, async function () {
     const emitter = new EventEmitter()
     const ipc = newIpc({ newClient })
-    ipc.listen('foo', (payload) => emitter.emit('foo', payload))
+    ipc.listen('foo', (...args) => emitter.emit('foo', ...args))
 
     const [actual] = await Promise.all([
-      emitted(emitter, 'foo'),
+      emitted(emitter, 'foo', { multiArgs: true }),
       ipc.notify('foo'),
     ])
-    expect(actual).to.equal(undefined)
+    expect(actual).to.deep.equal(['foo'])
   })
-  it(`restores listeners after reconnect`, async function () {
+  it(`restores listeners after connect`, async function () {
     const emitter = new EventEmitter()
     const proxy = newProxy(pgPort + 1, 'localhost', pgPort)
     const ipc = newIpc({
       newClient: () => newClient({ port: pgPort + 1 }),
     })
-    ipc.listen('foo', (payload) => emitter.emit('foo', payload))
+    ipc.listen('foo', (...args) => emitter.emit('foo', ...args))
 
     await emitted(ipc, 'ready')
     await Promise.all([emitted(ipc, 'disconnected'), proxy.end()])
@@ -244,10 +285,10 @@ describe('PgIpc', function () {
 
     const payload = { a: 1 }
     const [actual] = await Promise.all([
-      emitted(emitter, 'foo'),
+      emitted(emitter, 'foo', { multiArgs: true }),
       ipc.notify('foo', payload),
     ])
-    expect(actual).to.deep.equal(payload)
+    expect(actual).to.deep.equal(['foo', payload])
   })
   it(`multiple listeners on same topic`, async function () {
     let client
@@ -256,8 +297,8 @@ describe('PgIpc', function () {
     })
 
     const emitter = new EventEmitter()
-    const f1 = (payload) => emitter.emit('f1', payload)
-    const f2 = (payload) => emitter.emit('f2', payload)
+    const f1 = (...args) => emitter.emit('f1', ...args)
+    const f2 = (...args) => emitter.emit('f2', ...args)
 
     await Promise.all([
       emitted(client, 'query', {
@@ -308,7 +349,7 @@ describe('PgIpc', function () {
       forbidEvent(ipc, 'error')
     )
   })
-  it(`reconnection backoff`, async function () {
+  it(`connection backoff`, async function () {
     const ipc = newIpc({
       newClient: () => new MockClient({ rejectConnect: true }),
       reconnect: {
@@ -331,11 +372,86 @@ describe('PgIpc', function () {
       newClient: () => new MockClient({ rejectConnect: true }),
       reconnect: {
         maxRetries: 3,
+        initialDelay: 10,
       },
     })
 
     await expect(emitted(ipc, 'ready')).to.be.rejectedWith(
       /all 3 connect attempts failed/
     )
+  })
+  it(`error thrown by listener`, async function () {
+    const ipc = newIpc({ newClient })
+    await ipc.listen('foo', () => {
+      throw new Error('listener')
+    })
+    const [error] = await Promise.all([
+      emitted(ipc, 'error'),
+      ipc.notify('foo', {}),
+    ])
+    expect(error.message).to.equal('listener')
+  })
+  it(`stringify/parse`, async function () {
+    const emitter = new EventEmitter()
+    const ipc = newIpc({ newClient, stringify: (s) => s, parse: (s) => s })
+    await ipc.listen('foo', (...args) => emitter.emit('foo', ...args))
+    const expected = '{teszt}'
+    await Promise.all([
+      emitted(emitter, 'foo', {
+        multiArgs: true,
+        filter: ([channel, payload]) =>
+          channel === 'foo' && payload === expected,
+      }),
+      ipc.notify('foo', expected),
+    ])
+  })
+  it(`replays failed notify after connect`, async function () {
+    let connectCount = 0
+    let client
+    const ipc = newIpc({
+      newClient: () =>
+        (client = new MockClient({
+          deferConnect: true,
+          rejectQuery: connectCount++ === 0,
+        })),
+    })
+    if (!client.connectPromise) await emitted(client, 'connecting')
+    client.connectPromise?.resolve()
+    await emitted(ipc, 'ready')
+    ;[client] = await Promise.all([
+      emitted(ipc, 'connecting'),
+      ipc.notify('foo', { foo: 1 }),
+    ])
+    await Promise.all([
+      client.connectPromise?.resolve(),
+      emitted(client, 'query', {
+        multiArgs: true,
+        filter: ([, vars]) => vars[0] === 'foo',
+      }),
+    ])
+  })
+  it(`replays failed payloadless notify after connect`, async function () {
+    let connectCount = 0
+    let client
+    const ipc = newIpc({
+      newClient: () =>
+        (client = new MockClient({
+          deferConnect: true,
+          rejectQuery: connectCount++ === 0,
+        })),
+    })
+    if (!client.connectPromise) await emitted(client, 'connecting')
+    client.connectPromise?.resolve()
+    await emitted(ipc, 'ready')
+    ;[client] = await Promise.all([
+      emitted(ipc, 'connecting'),
+      ipc.notify('foo'),
+    ])
+    await Promise.all([
+      client.connectPromise?.resolve(),
+      emitted(client, 'query', {
+        filter: (query) => query.includes('foo'),
+      }),
+    ])
   })
 })

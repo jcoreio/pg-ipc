@@ -1,7 +1,7 @@
 {
   "name": "@jcoreio/pg-ipc",
   "version": "0.0.0-development",
-  "description": "more competent postgres pubsub than any other packages I've seen so far",
+  "description": "safer postgres pubsub with auto reconnect, channel length checks, and notify queue during reconnect",
   "main": "index.js",
   "sideEffects": false,
   "scripts": {
