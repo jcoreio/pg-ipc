@@ -2,11 +2,16 @@
 import EventEmitter from 'events'
 import StrictEventEmitter from 'strict-event-emitter-types'
 import type { Client, Notification } from 'pg'
+import { VError } from 'verror'
 
 export interface PgIpcEvents {
   error: (error: any) => void
-  connect: (client: Client) => void
+  clientError: (error: any) => void
+  connecting: (client: Client) => void
+  connected: (client: Client) => void
+  disconnected: () => void
   ready: () => void
+  end: () => void
 }
 
 type PgIpcEmitter = StrictEventEmitter<EventEmitter, PgIpcEvents>
@@ -124,39 +129,60 @@ export default class PgIpc<T = any> extends (EventEmitter as {
   }
 
   async end(): Promise<void> {
-    this.options.log?.debug('.end')
-    this.checkEnded()
-    this.ended = true
-    await this.client?.end()
+    try {
+      this.options.log?.debug('.end')
+      this.checkEnded()
+      this.ended = true
+      await this.client?.end()
+    } finally {
+      this.emit('end')
+    }
   }
 
   reconnect: () => Promise<void> = (): Promise<void> => {
+    const removeListeners = (client: Client) => {
+      client.removeListener('notification', this.handleNotification)
+      client.removeListener('error', this.handleError)
+    }
     const doReconnect = async () => {
       this.options.log?.debug('.reconnect')
       this.checkEnded()
-      if (this.client) {
-        this.client.removeListener('notification', this.handleNotification)
-        this.client.removeListener('error', this.handleError)
-        this.client.end().catch((error) => {
+      const prevClient = this.client
+      this.client = undefined
+      if (prevClient) {
+        removeListeners(prevClient)
+        prevClient.end().catch((error) => {
           this.options.log?.error('failed to end previous client:', error)
         })
       }
-      this.client = undefined
       const { initialDelay, maxDelay, maxRetries, factor } =
         this.options.reconnect
       let delay = initialDelay
       let retry = 0
       while (++retry <= maxRetries) {
+        this.checkEnded()
         try {
-          this.checkEnded()
           this.options.log?.debug('connecting...')
           const client = this.options.newClient()
           client.on('notification', this.handleNotification)
           client.on('error', this.handleError)
+          let connected = false
+          client.once('end', () => {
+            if (this.client === client) this.client = undefined
+            removeListeners(client)
+            if (connected && !this.ended) {
+              this.emit('disconnected')
+              this.reconnect().catch(() => {
+                /**/
+              })
+            }
+          })
+          this.emit('connecting', client)
           await client.connect()
+          connected = true
           this.options.log?.debug('connected')
           this.checkEnded()
-          this.emit('connect', client)
+          this.emit('connected', client)
           await this.replayListens(client)
           await this.replayNotifies(client)
           this.client = client
@@ -164,8 +190,15 @@ export default class PgIpc<T = any> extends (EventEmitter as {
           break
         } catch (error) {
           this.options.log?.error('failed to connect:', error)
-          this.emit('error', error)
-          if (retry >= maxRetries) throw error
+          if (retry >= maxRetries) {
+            const verror = new VError(
+              `all ${maxRetries} connect attempts failed`,
+              error
+            )
+            this.emit('error', verror)
+            throw verror
+          }
+          this.emit('clientError', error)
         }
         this.options.log?.debug('retrying in', delay, 'ms')
         await new Promise((resolve) => setTimeout(resolve, delay))
@@ -238,11 +271,8 @@ export default class PgIpc<T = any> extends (EventEmitter as {
   }
 
   private handleError: (error: Error) => void = (error: Error) => {
-    this.options.log?.error(error)
-    this.emit('error', error)
-    this.reconnect().catch(() => {
-      // ignore
-    })
+    this.options.log?.error('client error:', error)
+    this.emit('clientError', error)
   }
 
   async notify(channel: string, payload?: T): Promise<void> {

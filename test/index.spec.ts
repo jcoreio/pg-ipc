@@ -5,10 +5,19 @@ import { Client } from 'pg'
 import PgIpc from '../src'
 import EventEmitter from 'events'
 import emitted from 'p-event'
+import { createProxy } from 'node-tcp-proxy'
+
+const pgPort = parseInt(process.env.DB_PORT) || 5432
+const DEBUG = /(^|\b)pg-ipc(\b|$)/.test(process.env.DEBUG || '')
 
 class MockClient extends EventEmitter {
   ended = false
   queries = []
+
+  constructor({ rejectConnect = false }: { rejectConnect?: boolean } = {}) {
+    super()
+    this.rejectConnect = rejectConnect
+  }
 
   checkEnded() {
     if (this.ended) throw new Error(`MockClient already ended`)
@@ -16,10 +25,22 @@ class MockClient extends EventEmitter {
 
   async connect() {
     this.checkEnded()
-    this.emit('connect')
+    this.emit('connecting', this)
+    if (this.rejectConnect) {
+      const error = new Error('connection failed')
+      this.emit('error', error)
+      this.end().catch(() => {
+        /**/
+      })
+      throw error
+    } else {
+      this.emit('connected', this)
+      this.emit('ready')
+    }
   }
   async end() {
     this.checkEnded()
+    this.ended = true
     this.emit('end')
   }
   async query(...args) {
@@ -29,9 +50,9 @@ class MockClient extends EventEmitter {
 }
 
 async function during<R>(p: Promise<R>, ...effects: (() => any)[]): Promise<R> {
-  const cleanup = effects.map((e) => e())
+  const teardown = effects.map((e) => e())
   return p.finally(() => {
-    for (const c of cleanup) {
+    for (const c of teardown) {
       if (typeof c === 'function') c()
     }
   })
@@ -62,51 +83,56 @@ function forbidEvent(
 describe('PgIpc', function () {
   this.timeout(5000)
 
-  const clients = new Set()
-  const ipcs = new Set()
+  const teardown: (() => any)[] = []
 
   afterEach(async () => {
     try {
-      await Promise.all([
-        ...[...clients].map((c) => c.end()),
-        ...[...ipcs].map((i) => i.end()),
-      ])
+      await Promise.all(teardown.map((t) => t()))
     } finally {
-      clients.clear()
-      ipcs.clear()
+      teardown.length = 0
     }
   })
 
-  const newClient = () => {
+  const newClient = ({ port = pgPort }: { port?: number } = {}) => {
     const client = new Client({
       host: 'localhost',
-      port: parseInt(process.env.DB_PORT) || 5432,
+      port,
       user: 'postgres',
       password: 'password',
       database: 'postgres',
     })
-    clients.add(client)
-    return Object.create(client, {
-      end: {
-        value: () => {
-          clients.delete(client)
-          return client.end()
-        },
-      },
+    let ended = false
+    teardown.push(async () => {
+      if (!ended) await client.end()
     })
-  }
-
-  class TestIpc extends PgIpc {
-    end() {
-      ipcs.delete(this)
-      return super.end()
-    }
+    client.once('end', () => (ended = true))
+    return client
   }
 
   const newIpc = (options: PgIpcOptions) => {
-    const ipc = new TestIpc(options)
-    ipcs.add(ipc)
+    const ipc = new PgIpc({ log: DEBUG ? console : undefined, ...options })
+    let ended = false
+    ipc.once('end', () => (ended = true))
+    teardown.push(async () => {
+      if (!ended) await ipc.end()
+    })
     return ipc
+  }
+
+  const newProxy = (from: number, toHost: string, toPort: number) => {
+    const proxy = createProxy(from, toHost, toPort)
+    let ended = false
+    teardown.push(async () => {
+      if (!ended) proxy.end()
+    })
+    return Object.create(proxy, {
+      end: {
+        value: () => {
+          ended = true
+          return proxy.end()
+        },
+      },
+    })
   }
 
   it(`options validation`, async function () {
@@ -170,7 +196,7 @@ describe('PgIpc', function () {
   })
   it('basic test', async function () {
     const emitter = new EventEmitter()
-    const ipc = newIpc({ newClient, log: console })
+    const ipc = newIpc({ newClient })
     ipc.listen('foo', (payload) => emitter.emit('foo', payload))
     ipc.listen('bar', (payload) => emitter.emit('bar', payload))
 
@@ -195,7 +221,7 @@ describe('PgIpc', function () {
   })
   it(`payloadless notifications`, async function () {
     const emitter = new EventEmitter()
-    const ipc = newIpc({ newClient, log: console })
+    const ipc = newIpc({ newClient })
     ipc.listen('foo', (payload) => emitter.emit('foo', payload))
 
     const [actual] = await Promise.all([
@@ -206,21 +232,15 @@ describe('PgIpc', function () {
   })
   it(`restores listeners after reconnect`, async function () {
     const emitter = new EventEmitter()
-    let client
+    const proxy = newProxy(pgPort + 1, 'localhost', pgPort)
     const ipc = newIpc({
-      newClient: () => (client = newClient()),
-      log: console,
+      newClient: () => newClient({ port: pgPort + 1 }),
     })
     ipc.listen('foo', (payload) => emitter.emit('foo', payload))
 
     await emitted(ipc, 'ready')
-    await Promise.all([
-      emitted(ipc, 'error'),
-      (async () => {
-        await client.end()
-        client.emit('error', new Error('fake'))
-      })(),
-    ])
+    await Promise.all([emitted(ipc, 'disconnected'), proxy.end()])
+    newProxy(pgPort + 1, 'localhost', pgPort)
 
     const payload = { a: 1 }
     const [actual] = await Promise.all([
@@ -233,7 +253,6 @@ describe('PgIpc', function () {
     let client
     const ipc = newIpc({
       newClient: () => (client = new MockClient()),
-      log: console,
     })
 
     const emitter = new EventEmitter()
@@ -279,7 +298,6 @@ describe('PgIpc', function () {
     let client
     const ipc = newIpc({
       newClient: () => (client = new MockClient()),
-      log: console,
     })
     await ipc.end()
     await during(
@@ -288,6 +306,36 @@ describe('PgIpc', function () {
         await new Promise((resolve) => setTimeout(resolve, 1000))
       })(),
       forbidEvent(ipc, 'error')
+    )
+  })
+  it(`reconnection backoff`, async function () {
+    const ipc = newIpc({
+      newClient: () => new MockClient({ rejectConnect: true }),
+      reconnect: {
+        initialDelay: 100,
+      },
+    })
+
+    let t = Date.now()
+    await emitted(ipc, 'connecting')
+    expect(Date.now() - t).to.be.closeTo(100, 10)
+    t = Date.now()
+    await emitted(ipc, 'connecting')
+    expect(Date.now() - t).to.be.closeTo(200, 20)
+    t = Date.now()
+    await emitted(ipc, 'connecting')
+    expect(Date.now() - t).to.be.closeTo(400, 40)
+  })
+  it(`maxRetries`, async function () {
+    const ipc = newIpc({
+      newClient: () => new MockClient({ rejectConnect: true }),
+      reconnect: {
+        maxRetries: 3,
+      },
+    })
+
+    await expect(emitted(ipc, 'ready')).to.be.rejectedWith(
+      /all 3 connect attempts failed/
     )
   })
 })
