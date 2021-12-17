@@ -1,6 +1,8 @@
 /* eslint-disable */
 
 const { before } = require('mocha')
+const chai = require('chai')
+chai.use(require('chai-as-promised'))
 require('@babel/register')({ extensions: ['.js', '.ts'] })
 
 if (process.argv.indexOf('--watch') >= 0) {
