@@ -82,9 +82,7 @@ type ResolvedPgIpcOptions<T = any> = {
 
 export type Listener<T = any> = (channel: string, payload?: T) => any
 
-function quoteIdentifier(id: string): string {
-  return /^[_a-z][_a-z0-9$]*$/i.test(id) ? id : `"${id.replace(/"/g, '""')}"`
-}
+const quoteIdentifier = (id: string): string => `"${id.replace(/"/g, '""')}"`
 
 type PgIpcEmitter = StrictEventEmitter<EventEmitter, PgIpcEvents>
 
