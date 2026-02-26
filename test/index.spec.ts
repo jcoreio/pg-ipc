@@ -1,13 +1,18 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import { Client } from 'pg'
-import PgIpc from '../src'
+import PgIpc, { PgIpcOptions } from '../src'
 import EventEmitter from 'events'
 import emitted from 'p-event'
+// @ts-expect-error no type defs
 import { createProxy } from 'node-tcp-proxy'
+import assert from 'assert'
+import { inspect } from 'util'
+// @ts-expect-error no type defs
+import execa from '@jcoreio/toolchain/util/execa.cjs'
+import defaultenv from 'defaultenv'
 
-const pgPort = parseInt(process.env.DB_PORT) || 5432
+let pgPort = parseInt(process.env.DB_PORT || '5432')
 const DEBUG = /(^|\b)pg-ipc(\b|$)/.test(process.env.DEBUG || '')
 
 class MockClient extends EventEmitter {
@@ -15,7 +20,7 @@ class MockClient extends EventEmitter {
   deferConnect: boolean
   rejectConnect: boolean
   rejectQuery: boolean
-  queries = []
+  queries: [query: string, params?: unknown[]][] = []
 
   connectPromise:
     | undefined
@@ -47,7 +52,7 @@ class MockClient extends EventEmitter {
     this.checkEnded()
     this.emit('connecting', this)
     if (this.deferConnect) {
-      await new Promise(
+      await new Promise<void>(
         (resolve, reject) => (this.connectPromise = { resolve, reject })
       )
     }
@@ -68,7 +73,7 @@ class MockClient extends EventEmitter {
     this.ended = true
     this.emit('end')
   }
-  async query(...args) {
+  async query(...args: [query: string, params?: unknown[]]) {
     if (this.rejectQuery) {
       const error = new Error('connection failed')
       this.emit('error', error)
@@ -97,7 +102,7 @@ function forbidEvent(
   { filter = () => true }: { filter?: (...args: any[]) => boolean } = {}
 ): () => () => void {
   return () => {
-    let event = null
+    let event: any = null
     const handler = (...args: any[]) => {
       if (filter(...args)) event = args
     }
@@ -106,12 +111,19 @@ function forbidEvent(
       e.off(name, handler)
       if (event) {
         throw new Error(
-          `expected ${e} not to emit ${name}, but got ${JSON.stringify(event)}`
+          `expected ${inspect(e)} not to emit ${name}, but got ${JSON.stringify(event)}`
         )
       }
     }
   }
 }
+
+before(async () => {
+  if (process.env.CI) return
+  defaultenv(['env/local.js'])
+  pgPort = parseInt(process.env.DB_PORT || '5432')
+  await execa('docker', ['compose', 'up', '-d'], { stdio: 'inherit' })
+})
 
 describe('PgIpc', function () {
   this.timeout(5000)
@@ -221,7 +233,7 @@ describe('PgIpc', function () {
     await expect(ipc2.notify('a'.repeat(128), 'a')).to.be.rejected
   })
   it(`doesn't allow any actions after .end`, async function () {
-    const ipc = newIpc({ newClient: new MockClient() })
+    const ipc = newIpc({ newClient: () => new MockClient() })
     await ipc.end()
     await expect(ipc.end()).to.be.rejected
     await expect(ipc.connect()).to.be.rejected
@@ -240,8 +252,8 @@ describe('PgIpc', function () {
   it('basic test', async function () {
     const emitter = new EventEmitter()
     const ipc = newIpc({ newClient })
-    ipc.listen('foo', (...args) => emitter.emit('foo', ...args))
-    ipc.listen('bar', (...args) => emitter.emit('bar', ...args))
+    await ipc.listen('foo', (...args) => emitter.emit('foo', ...args))
+    await ipc.listen('bar', (...args) => emitter.emit('bar', ...args))
 
     const payload = { a: 1 }
     const [actual] = await Promise.all([
@@ -263,7 +275,7 @@ describe('PgIpc', function () {
   it(`payloadless notifications`, async function () {
     const emitter = new EventEmitter()
     const ipc = newIpc({ newClient })
-    ipc.listen('foo', (...args) => emitter.emit('foo', ...args))
+    await ipc.listen('foo', (...args) => emitter.emit('foo', ...args))
 
     const [actual] = await Promise.all([
       emitted(emitter, 'foo', { multiArgs: true }),
@@ -277,7 +289,7 @@ describe('PgIpc', function () {
     const ipc = newIpc({
       newClient: () => newClient({ port: pgPort + 1 }),
     })
-    ipc.listen('foo', (...args) => emitter.emit('foo', ...args))
+    await ipc.listen('foo', (...args) => emitter.emit('foo', ...args))
 
     await emitted(ipc, 'ready')
     await Promise.all([emitted(ipc, 'disconnected'), proxy.end()])
@@ -291,15 +303,18 @@ describe('PgIpc', function () {
     expect(actual).to.deep.equal(['foo', payload])
   })
   it(`multiple listeners on same topic`, async function () {
-    let client
+    let client: MockClient | undefined
     const ipc = newIpc({
       newClient: () => (client = new MockClient()),
     })
 
     const emitter = new EventEmitter()
-    const f1 = (...args) => emitter.emit('f1', ...args)
-    const f2 = (...args) => emitter.emit('f2', ...args)
+    const f1 = (...args: [channel: string, message?: string]) =>
+      emitter.emit('f1', ...args)
+    const f2 = (...args: [channel: string, message?: string]) =>
+      emitter.emit('f2', ...args)
 
+    assert(client)
     await Promise.all([
       emitted(client, 'query', {
         filter: (q) => q.startsWith(`LISTEN """foo"`),
@@ -311,6 +326,7 @@ describe('PgIpc', function () {
     await Promise.all([
       emitted(emitter, 'f1'),
       emitted(emitter, 'f2'),
+      // eslint-disable-next-line @typescript-eslint/await-thenable
       client.emit('notification', {
         channel: '"foo',
         payload: JSON.stringify(payload),
@@ -321,6 +337,7 @@ describe('PgIpc', function () {
     await during(
       Promise.all([
         emitted(emitter, 'f2'),
+        // eslint-disable-next-line @typescript-eslint/await-thenable
         client.emit('notification', {
           channel: '"foo',
           payload: JSON.stringify(payload),
@@ -336,10 +353,11 @@ describe('PgIpc', function () {
     ])
   })
   it(`notification after end`, async function () {
-    let client
+    let client: MockClient | undefined
     const ipc = newIpc({
       newClient: () => (client = new MockClient()),
     })
+    assert(client)
     await ipc.end()
     await during(
       (async () => {
@@ -407,7 +425,7 @@ describe('PgIpc', function () {
   })
   it(`replays failed notify after connect`, async function () {
     let connectCount = 0
-    let client
+    let client: MockClient | undefined
     const ipc = newIpc({
       newClient: () =>
         (client = new MockClient({
@@ -415,6 +433,7 @@ describe('PgIpc', function () {
           rejectQuery: connectCount++ === 0,
         })),
     })
+    assert(client)
     if (!client.connectPromise) await emitted(client, 'connecting')
     client.connectPromise?.resolve()
     await emitted(ipc, 'ready')
@@ -422,7 +441,9 @@ describe('PgIpc', function () {
       emitted(ipc, 'connecting'),
       ipc.notify('foo', { foo: 1 }),
     ])
+    assert(client)
     await Promise.all([
+      // eslint-disable-next-line @typescript-eslint/await-thenable
       client.connectPromise?.resolve(),
       emitted(client, 'query', {
         multiArgs: true,
@@ -432,7 +453,7 @@ describe('PgIpc', function () {
   })
   it(`replays failed payloadless notify after connect`, async function () {
     let connectCount = 0
-    let client
+    let client: MockClient | undefined
     const ipc = newIpc({
       newClient: () =>
         (client = new MockClient({
@@ -440,6 +461,7 @@ describe('PgIpc', function () {
           rejectQuery: connectCount++ === 0,
         })),
     })
+    assert(client)
     if (!client.connectPromise) await emitted(client, 'connecting')
     client.connectPromise?.resolve()
     await emitted(ipc, 'ready')
@@ -447,7 +469,9 @@ describe('PgIpc', function () {
       emitted(ipc, 'connecting'),
       ipc.notify('foo'),
     ])
+    assert(client)
     await Promise.all([
+      // eslint-disable-next-line @typescript-eslint/await-thenable
       client.connectPromise?.resolve(),
       emitted(client, 'query', {
         filter: (query) => query.includes('foo'),

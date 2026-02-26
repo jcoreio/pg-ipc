@@ -1,0 +1,9 @@
+module.exports = {
+  cjsBabelEnv: { targets: { node: 20 } },
+  esmBabelEnv: { targets: { node: 20 } },
+  // outputEsm: false, // disables ESM output (default: true)
+  buildIgnore: [],
+  hasTypeScriptSources: true,
+  // esWrapper: true, // outputs ES module wrappers for CJS modules (default: false)
+  // sourceMaps: false, // default is true (outputs .map files, also accepts 'inline' or 'both')
+}

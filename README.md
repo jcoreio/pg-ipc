@@ -63,7 +63,7 @@ type PgIpcOptions<
   /**
    * Payload type
    */
-  T = any
+  T = any,
 > = {
   /**
    * Creates a new pg Client.  This will be called on every connection attempt

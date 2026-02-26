@@ -1,8 +1,8 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import EventEmitter from 'events'
 import StrictEventEmitter from 'strict-event-emitter-types'
-import type { Client, Notification } from 'pg'
-import { VError } from 'verror'
+// eslint-disable-next-line @jcoreio/implicit-dependencies/no-implicit
+import type { Notification } from 'pg'
+import VError from 'verror'
 
 export interface PgIpcEvents {
   error: (error: any) => void
@@ -14,16 +14,38 @@ export interface PgIpcEvents {
   end: () => void
 }
 
+interface Client {
+  query(query: string, params?: unknown[]): Promise<unknown>
+  connect(): Promise<void>
+  end(): Promise<void>
+
+  on(event: 'notification', listener: (message: Notification) => void): this
+  on(event: 'error', listener: (err: Error) => void): this
+
+  once(event: 'end', listener: () => void): this
+
+  removeListener(
+    event: 'notification',
+    listener: (message: Notification) => void
+  ): this
+  removeListener(event: 'error', listener: (err: Error) => void): this
+}
+
 export type PgIpcOptions<
   /**
    * Payload type
    */
-  T = any
+  T = any,
 > = {
   /**
    * Creates a new pg Client.  This will be called on every connection attempt
    */
   newClient: () => Client
+  /**
+   * If given, this function will be called to perform notifications instead of performing
+   * queries on the listener client
+   */
+  notify?: (channel: string, message?: string) => Promise<unknown>
   /**
    * Pass an object with some or all console methods to enable logging
    */
@@ -70,6 +92,7 @@ export type PgIpcOptions<
 type ResolvedPgIpcOptions<T = any> = {
   maxChannelLength: number
   newClient: () => Client
+  notify?: (channel: string, message?: string) => Promise<unknown>
   stringify: (payload: T) => string
   parse: (rawPayload: string) => T
   reconnect: {
@@ -98,6 +121,7 @@ export default class PgIpc<T = any> extends (EventEmitter as {
   constructor({
     log,
     newClient,
+    notify,
     maxChannelLength,
     stringify,
     parse,
@@ -147,6 +171,7 @@ export default class PgIpc<T = any> extends (EventEmitter as {
     this.log = log
     this.options = {
       newClient,
+      notify,
       stringify: stringify || ((payload) => JSON.stringify(payload)),
       parse: parse || ((raw) => JSON.parse(raw)),
       maxChannelLength: maxChannelLength ?? 63,
@@ -163,7 +188,7 @@ export default class PgIpc<T = any> extends (EventEmitter as {
         factor: reconnect?.factor ?? 2,
       },
     }
-    this.connect()
+    void this.connect()
   }
 
   private checkLength(channel: string): void {
@@ -212,7 +237,7 @@ export default class PgIpc<T = any> extends (EventEmitter as {
       this.client = undefined
       if (prevClient) {
         removeListeners(prevClient)
-        prevClient.end().catch((error) => {
+        prevClient.end().catch((error: unknown) => {
           this.log?.error?.('failed to end previous client:', error)
         })
       }
@@ -305,24 +330,37 @@ export default class PgIpc<T = any> extends (EventEmitter as {
     }
   }
 
+  private async performNotify(
+    client: Client,
+    channel: string,
+    message?: string
+  ) {
+    if (this.options.notify) {
+      return await this.options.notify(channel, message)
+    }
+    if (message != null) {
+      await client.query(`SELECT pg_notify($1, $2)`, [channel, message])
+    } else {
+      await client.query(`NOTIFY ${quoteIdentifier(channel)}`)
+    }
+  }
+
   private async replayNotifies(client: Client): Promise<void> {
     for (let i = 0; i < this.notifyQueue.length; i++) {
       const notification = this.notifyQueue[i]
       if (!notification) continue
-      if (notification.length === 2) {
-        const [channel, payload] = notification
+      const [channel, payload] = notification
+      if (payload != null) {
         this.log?.debug?.('replaying notify', {
           channel,
           payload,
         })
-        await client.query(`SELECT pg_notify($1, $2)`, [channel, payload])
       } else {
-        const [channel] = notification
         this.log?.debug?.('replaying notify', {
           channel,
         })
-        await client.query(`NOTIFY ${quoteIdentifier(channel)}`)
       }
+      await this.performNotify(client, channel, payload)
       this.notifyQueue[i] = null
       this.checkEnded()
     }
@@ -365,6 +403,28 @@ export default class PgIpc<T = any> extends (EventEmitter as {
     this.checkEnded()
     this.checkLength(channel)
     const { client } = this
+
+    if (this.options.notify) {
+      const stringified = payload ? this.options.stringify(payload) : undefined
+      await this.options
+        .notify(channel, stringified)
+        .catch((error: unknown) => {
+          this.warning(
+            new VError(
+              error instanceof Error ? error : new Error(String(error)),
+              'NOTIFY failed, will retry upon reconnection'
+            )
+          )
+          if (stringified != null) {
+            this.log?.debug?.('enqueuing', { channel, stringified })
+            this.notifyQueue.push([channel, stringified])
+          } else {
+            this.log?.debug?.('enqueuing', { channel })
+            this.notifyQueue.push([channel])
+          }
+        })
+      return
+    }
     if (payload) {
       const stringified = this.options.stringify(payload)
       const enqueue = () => {
@@ -378,9 +438,12 @@ export default class PgIpc<T = any> extends (EventEmitter as {
       else
         await client
           .query(`SELECT pg_notify($1, $2)`, [channel, stringified])
-          .catch((error) => {
+          .catch((error: unknown) => {
             this.warning(
-              new VError(error, 'NOTIFY failed, will retry upon reconnection')
+              new VError(
+                error instanceof Error ? error : new Error(String(error)),
+                'NOTIFY failed, will retry upon reconnection'
+              )
             )
             enqueue()
           })
@@ -395,9 +458,12 @@ export default class PgIpc<T = any> extends (EventEmitter as {
       else
         await client
           .query(`NOTIFY ${quoteIdentifier(channel)}`)
-          .catch((error) => {
+          .catch((error: unknown) => {
             this.warning(
-              new VError(error, 'NOTIFY failed, will retry upon reconnection')
+              new VError(
+                error instanceof Error ? error : new Error(String(error)),
+                'NOTIFY failed, will retry upon reconnection'
+              )
             )
             enqueue()
           })
