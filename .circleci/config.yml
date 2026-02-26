@@ -9,7 +9,7 @@ jobs:
   build:
     docker:
       - image: cimg/node:20.10.0
-      - image: circleci/postgres:16.12-alpine
+      - image: postgres:16.12-alpine
         environment:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: password
